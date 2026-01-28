@@ -1,224 +1,173 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-# Manual calculation of indicators to avoid dependency issues
-from groq import Groq
+import pandas_ta as ta
 from duckduckgo_search import DDGS
+from groq import Groq
 import requests
-import datetime
 
-# --- Page Config ---
-st.set_page_config(page_title="God-Tier Stock & Nifty Analysis", layout="wide")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="God-Tier Trade AI", layout="wide")
 
-# --- Sidebar for API Keys ---
-with st.sidebar:
-    st.header("🔑 API Configurations")
-    groq_api_key = st.text_input("Groq API Key", type="password")
-    telegram_bot_token = st.text_input("Telegram Bot Token", type="password")
-    telegram_chat_id = st.text_input("Telegram Chat ID")
-    
-    st.info("Note: No data is stored. This dashboard uses the Groq Llama3-70b model.")
+# --- SIDEBAR: API KEYS ---
+st.sidebar.title("🔑 API Keys & Settings")
+GROQ_API_KEY = st.sidebar.text_input("Groq API Key", type="password")
+TELEGRAM_BOT_TOKEN = st.sidebar.text_input("Telegram Bot Token", type="password")
+TELEGRAM_CHAT_ID = st.sidebar.text_input("Telegram Chat ID")
 
-# --- Agent 1: Technical Analyst ---
+# --- FUNCTIONS ---
+
 def get_technical_analysis(ticker):
+    """
+    Fetches data and calculates technical indicators safely.
+    Fixes the 'Identically-labeled Series' error by using .iloc[-1] for final values.
+    """
     try:
-        data = yf.download(ticker, period="1y", interval="1d")
-        if data.empty:
-            return None, "Ticker not found or no data available."
+        # 1. Fetch Data
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="6mo")
         
-        # Calculate RSI
-        delta = data['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        data['RSI'] = 100 - (100 / (1 + rs))
+        if df.empty:
+            return None, "No Data Found"
         
-        # Calculate MACD
-        exp1 = data['Close'].ewm(span=12, adjust=False).mean()
-        exp2 = data['Close'].ewm(span=26, adjust=False).mean()
-        data['MACD'] = exp1 - exp2
-        data['Signal_Line'] = data['MACD'].ewm(span=9, adjust=False).mean()
+        # 2. Calculate Indicators (RSI, EMA, MACD)
+        # Using pandas_ta to add columns directly
+        df.ta.rsi(length=14, append=True)
+        df.ta.ema(length=50, append=True)
+        df.ta.macd(append=True)
         
-        # Calculate EMA 50
-        data['EMA_50'] = data['Close'].ewm(span=50, adjust=False).mean()
+        # 3. Get the LATEST Row (Aaj ka data)
+        # Isse 'Series' error nahi aayega kyunki hum sirf last value utha rahe hain
+        latest = df.iloc[-1]
         
-        latest = data.iloc[-1]
-        
-        rsi_val = latest['RSI']
-        macd_val = latest['MACD']
-        macd_signal = latest['Signal_Line']
+        # Safe extraction of values
+        close_price = latest['Close']
+        rsi = latest['RSI_14']
         ema_50 = latest['EMA_50']
-        current_price = latest['Close']
+        macd = latest['MACD_12_26_9']
+        macd_signal = latest['MACDs_12_26_9']
         
-        # Trend Determination
-        trend = "Neutral"
-        if current_price > ema_50 and macd_val > macd_signal and rsi_val > 50:
-            trend = "Bullish"
-        elif current_price < ema_50 and macd_val < macd_signal and rsi_val < 50:
-            trend = "Bearish"
-            
-        # Convert to float to avoid pandas Series issues
-        cp_val = float(current_price.iloc[0]) if isinstance(current_price, pd.Series) else float(current_price)
-        rsi_v = float(rsi_val.iloc[0]) if isinstance(rsi_val, pd.Series) else float(rsi_val)
-        macd_v = float(macd_val.iloc[0]) if isinstance(macd_val, pd.Series) else float(macd_val)
-        macd_s = float(macd_signal.iloc[0]) if isinstance(macd_signal, pd.Series) else float(macd_signal)
-        ema_v = float(ema_50.iloc[0]) if isinstance(ema_50, pd.Series) else float(ema_50)
+        # 4. Generate Technical Signal
+        signal = "NEUTRAL"
+        score = 0
+        
+        # RSI Logic
+        if rsi < 30: score += 1      # Oversold (Buy signal)
+        elif rsi > 70: score -= 1    # Overbought (Sell signal)
+        
+        # EMA Logic (Trend)
+        if close_price > ema_50: score += 1
+        else: score -= 1
+        
+        # MACD Logic
+        if macd > macd_signal: score += 1
+        else: score -= 1
+        
+        if score >= 2: signal = "BULLISH (BUY CALL)"
+        elif score <= -2: signal = "BEARISH (BUY PUT)"
+        
+        return {
+            "current_price": close_price,
+            "rsi": rsi,
+            "trend": "Up" if close_price > ema_50 else "Down",
+            "signal": signal
+        }, None
 
-        tech_summary = {
-            "current_price": round(cp_val, 2),
-            "rsi": round(rsi_v, 2),
-            "macd": round(macd_v, 4),
-            "macd_signal": round(macd_s, 4),
-            "ema_50": round(ema_v, 2),
-            "trend": trend,
-            "data": data
-        }
-        return tech_summary, None
     except Exception as e:
         return None, str(e)
 
-# --- Agent 2: Sentiment Spy ---
-def get_sentiment_analysis(ticker):
+def get_sentiment(ticker):
+    """Gets news and sentiment using DuckDuckGo"""
     try:
         with DDGS() as ddgs:
-            # Search for news and reddit mentions
-            query = f"{ticker} stock news reddit sentiment"
-            results = list(ddgs.text(query, max_results=5))
+            # Using clean keywords for better results
+            keywords = f"{ticker} stock news market sentiment"
+            results = list(ddgs.text(keywords, max_results=5))
             
             if not results:
-                return "No recent news or sentiment found.", "Neutral"
-            
-            news_snippets = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
-            return news_snippets, "Analysis Pending"
+                return "No news found."
+                
+            summary = " ".join([r['body'] for r in results])
+            return summary[:2000] # Limit text for LLM
     except Exception as e:
-        return f"Error fetching sentiment: {str(e)}", "Error"
+        return f"Error fetching news: {e}"
 
-# --- Agent 3: The God Brain (LLM Logic) ---
-def get_god_brain_verdict(api_key, tech_data, sentiment_data, ticker):
-    if not api_key:
-        return "Please provide Groq API Key", "N/A"
+def get_god_verdict(ticker, tech_data, news_summary):
+    """Sends everything to Groq AI for the final decision"""
+    if not GROQ_API_KEY:
+        return "Please enter Groq API Key in sidebar."
     
-    client = Groq(api_key=api_key)
+    client = Groq(api_key=GROQ_API_KEY)
     
     prompt = f"""
-    Act as a 'God-Tier' Financial Analyst. Analyze the following data for ticker: {ticker}
+    Act as a Hedge Fund Manager. Analyze this data for {ticker}:
     
-    TECHNICAL DATA:
-    - Current Price: {tech_data['current_price']}
-    - RSI: {tech_data['rsi']}
-    - MACD: {tech_data['macd']} (Signal: {tech_data['macd_signal']})
-    - 50-Day EMA: {tech_data['ema_50']}
-    - Calculated Trend: {tech_data['trend']}
+    1. TECHNICALS:
+    - Price: {tech_data['current_price']}
+    - RSI: {tech_data['rsi']} (Over 70=Overbought, Under 30=Oversold)
+    - Trend: {tech_data['trend']}
+    - Algo Signal: {tech_data['signal']}
     
-    SENTIMENT DATA (News/Reddit):
-    {sentiment_data}
+    2. NEWS SENTIMENT:
+    {news_summary}
     
-    Your Task:
-    1. Evaluate the synergy between Technicals and Sentiment.
-    2. Determine a clear trade signal: BUY CALL, BUY PUT, or NO TRADE.
-    3. Provide a brief 2-sentence justification.
-    
-    Return the response in this EXACT format:
-    SIGNAL: [SIGNAL_HERE]
-    JUSTIFICATION: [JUSTIFICATION_HERE]
+    DECISION:
+    Based on both technicals and news, give a ONE WORD Verdict: "BUY_CALL", "BUY_PUT", or "WAIT".
+    Then give a 1-line reason why.
     """
     
     try:
         completion = client.chat.completions.create(
-            model="llama3-70b-8192",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+            model="llama3-70b-8192",
         )
-        response = completion.choices[0].message.content
-        return response
+        return completion.choices[0].message.content
     except Exception as e:
-        return f"LLM Error: {str(e)}"
+        return f"AI Error: {e}"
 
-# --- Telegram Alert Function ---
-def send_telegram_alert(token, chat_id, message):
-    if not token or not chat_id:
-        return False, "Telegram credentials missing."
-    
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-    
-    try:
-        response = requests.post(url, json=payload)
-        if response.status_code == 200:
-            return True, "Alert sent successfully!"
-        else:
-            return False, f"Failed to send alert: {response.text}"
-    except Exception as e:
-        return False, str(e)
+def send_telegram_alert(message):
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+        try:
+            requests.post(url, data=data)
+            return True
+        except:
+            return False
+    return False
 
-# --- Main Dashboard UI ---
-st.title("🚀 God-Tier Stock & Nifty Analysis Dashboard")
-st.markdown("---")
+# --- MAIN UI ---
+st.title("🚀 God-Tier Stock & Nifty AI")
 
-ticker = st.text_input("Enter Ticker (e.g., ^NSEI, RELIANCE.NS, TSLA, BTC-USD)", value="^NSEI").upper()
+ticker = st.text_input("Enter Ticker (e.g., ^NSEI, RELIANCE.NS, TATAMOTORS.NS)", value="^NSEI")
 
 if st.button("Analyze Now"):
-    if not groq_api_key:
-        st.error("Please enter your Groq API Key in the sidebar.")
-    else:
-        with st.spinner(f"Analyzing {ticker}..."):
-            # 1. Technical Analysis
-            tech_data, error = get_technical_analysis(ticker)
-            
-            if error:
-                st.error(error)
-            else:
-                # 2. Sentiment Analysis
-                sentiment_text, _ = get_sentiment_analysis(ticker)
-                
-                # 3. God Brain Verdict
-                verdict = get_god_brain_verdict(groq_api_key, tech_data, sentiment_text, ticker)
-                
-                # --- Display Results ---
-                col1, col2 = st.columns([1, 1])
-                
-                with col1:
-                    st.subheader("📊 Technical Indicators")
-                    st.metric("Live Price", f"{tech_data['current_price']}")
-                    st.metric("RSI (14)", f"{tech_data['rsi']}")
-                    st.metric("50-Day EMA", f"{tech_data['ema_50']}")
-                    st.write(f"**Trend:** {tech_data['trend']}")
-                    
-                    # Chart
-                    st.line_chart(tech_data['data']['Close'])
-                
-                with col2:
-                    st.subheader("🕵️ Sentiment Spy")
-                    st.info(sentiment_text[:1000] + "..." if len(sentiment_text) > 1000 else sentiment_text)
-                
-                st.markdown("---")
-                st.subheader("🧠 The God Brain Verdict")
-                
-                # Parse Signal for Styling
-                signal_color = "white"
-                if "BUY CALL" in verdict.upper():
-                    signal_color = "#00FF00" # Green
-                elif "BUY PUT" in verdict.upper():
-                    signal_color = "#FF0000" # Red
-                
-                st.markdown(f"""
-                <div style="padding:20px; border-radius:10px; border: 2px solid {signal_color}; background-color: rgba(0,0,0,0.1);">
-                    <h2 style="color:{signal_color}; text-align:center;">{verdict.split('JUSTIFICATION:')[0].replace('SIGNAL:', '').strip()}</h2>
-                    <p style="font-size:1.2em;">{verdict.split('JUSTIFICATION:')[1].strip() if 'JUSTIFICATION:' in verdict else ''}</p>
-                </div>
-                """, unsafe_allow_index=True)
-                
-                # Store verdict in session state for alert
-                st.session_state['last_verdict'] = f"Ticker: {ticker}\n{verdict}"
-
-# --- Alert Section ---
-st.markdown("---")
-if 'last_verdict' in st.session_state:
-    if st.button("📢 Send Alert to Telegram"):
-        success, msg = send_telegram_alert(telegram_bot_token, telegram_chat_id, st.session_state['last_verdict'])
-        if success:
-            st.success(msg)
+    with st.spinner('Asking the Market Gods...'):
+        
+        # 1. Technical Analysis
+        tech_data, error = get_technical_analysis(ticker)
+        
+        if error:
+            st.error(f"Error: {error}")
         else:
-            st.error(msg)
-else:
-    st.write("Run an analysis first to enable alerts.")
+            # Display Metrics
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Price", f"₹{tech_data['current_price']:.2f}")
+            col2.metric("RSI", f"{tech_data['rsi']:.2f}")
+            col3.metric("Trend", tech_data['trend'])
+            
+            # 2. Sentiment Analysis
+            st.subheader("🕵️ Sentiment Spy")
+            news_summary = get_sentiment(ticker)
+            st.info(news_summary[:500] + "...")
+            
+            # 3. God Verdict
+            st.subheader("⚡ God Brain Verdict")
+            verdict = get_god_verdict(ticker, tech_data, news_summary)
+            st.success(verdict)
+            
+            # 4. Notification
+            if "BUY" in verdict.upper():
+                msg = f"🚨 TRADE ALERT: {ticker}\nVerdict: {verdict}\nPrice: {tech_data['current_price']}"
+                if send_telegram_alert(msg):
+                    st.toast("Telegram Alert Sent! 📲")
