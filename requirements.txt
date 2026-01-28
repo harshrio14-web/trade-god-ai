@@ -1,7 +1,7 @@
 streamlit
 yfinance
 pandas
-groq
+pandas_ta
 duckduckgo-search
+groq
 requests
-python-dotenv
