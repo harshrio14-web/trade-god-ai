@@ -1,3 +1,4 @@
+# Version 2.0 - Fixed API and Error
 import streamlit as st
 import yfinance as yf
 import pandas as pd
